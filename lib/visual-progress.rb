@@ -27,8 +27,9 @@ module VP
       #  byebug
       d = line.add_component(content: spin[0], left_pad: 2, justify: :right, right_pad: 2, style: {background: :yellow, color: :black, mode: :bold})
       #  byebug
+      e = line.add_component(content: 'a sentence', fill: true, justify: :right, right_pad: 1, left_pad: 1, style: {background: :blue})
       while true
-        sleep(0.1)
+        sleep(0.2)
         a.update(Time.now)
         b.update(Time.now)
         d.update(spin[spin_idx % 4])
@@ -45,11 +46,19 @@ module VP
       @cursor = Cursor.new(self)
       @components = {fills: [], fixed: []}
       @offsets = {}
+      @refresh_counter = 0
       rewiden #TODO trap sigwinch and call this
     end
 
     def refresh(component)
-      cursor.reflow(from: offsets[component], to: offsets[component] + component.length)
+      if @refresh_counter > 64
+        @refresh_counter = 0
+        reset
+      else
+        @refresh_counter += 1
+        cursor.locate
+        cursor.reflow(from: offsets[component], to: offsets[component] + component.length)
+      end
     end
 
     def reset # TODO refactor bc this is ugly af
@@ -70,7 +79,8 @@ module VP
         self[offset, fixed.length] = fixed
       end
       components[:fixed].select {|a| a.justify == :right}.each do |fixed|
-        offset = first_free(from: :right) - fixed.length
+        #byebug
+        offset = first_free(from: :right) - fixed.length + 1
         offsets[fixed] = offset
         self[offset, fixed.length] = fixed
       end
@@ -86,9 +96,9 @@ module VP
         self[offset, fill_space_per] = fill
       end
       components[:fills].select {|a| a.justify == :right}.each do |fill|
-        offset = first_free(from: :right) - fill_space_per
+        offset = first_free(from: :right) - fill_space_per + 1
         offsets[fill] = offset
-        self[first_free(from: :right) - fill_space_per, fill_space_per] = fill
+        self[offset - fill_space_per, fill_space_per] = fill
       end
       cursor.reflow
     end
@@ -190,8 +200,13 @@ module VP
       @position = 0
     end
 
+    def locate
+      (line.length * 2).times {left}
+    end
+
     def reflow(from: 0, to: nil)
       to ||= upper_bound
+      line[from, to].nil? && byebug
       line[from, to].each {|c| c.drawn = false}
       [to, from]
         .sort {|a,b| ((position - a).abs < (position - b).abs) ? -1 : 1}
@@ -199,7 +214,7 @@ module VP
     end
 
     def draw
-      return false if line[position].drawn
+      return false if line[position].nil? || line[position].drawn
       draw!
     end
 
