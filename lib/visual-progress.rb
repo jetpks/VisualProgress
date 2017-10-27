@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 #2.4.2
+
 require 'colorize'
 require 'set'
 require 'pry-byebug'
@@ -9,114 +10,201 @@ module VP
   class NoRoomLeftAtTheInn < StandardError; end
 
   class VisualProgress
-    attr_reader :chars, :width
-    def initialize(chars: nil)
-      #@chars = chars || 
+    attr_accessor :sleep_time
+    attr_reader :chars, :width, :components, :writer
+
+    def initialize(sleep_time: 0.2)
+      @sleep_time = sleep_time
       @line = Line.new
-      #Signal.trap('SIGWINCH', resize)
+      @winch = Winch.new {line.refresh}
+      @stdout_queue = Queue.new
+      @components = Components.new(line)
+      line.components = @components.members
+
+      read, write = IO.pipe
+      @writer = write
+      Thread.new(read) {|read| read_thread(read)}.abort_on_exception = true
+      Thread.new {write_thread}.abort_on_exception = true
     end
 
-    def timestamp
-      spin = %w{\\ | / -}
-      spin_idx = 0
-      a = line.add_component(content: Time.now, left_pad: 4, right_pad: 4)
-      #  byebug
-      b = line.add_component(content: Time.now, justify: :right, left_pad: 4, right_pad: 4)
-      #  byebug
-      c = line.add_component(content: 'hello', style: {background: :blue, color: :red, mode: :bold})
-      #  byebug
-      d = line.add_component(content: spin[0], left_pad: 2, justify: :right, right_pad: 2, style: {background: :yellow, color: :black, mode: :bold})
-      #  byebug
-      e = line.add_component(content: 'a sentence', fill: true, justify: :right, right_pad: 1, left_pad: 1, style: {background: :blue})
+    def read_thread(pipe)
       while true
-        sleep(0.2)
-        a.update(Time.now)
-        b.update(Time.now)
-        d.update(spin[spin_idx % 4])
-        spin_idx += 1
+        stdout_queue << pipe.gets
       end
     end
+
+    def write_thread
+      while true
+        winch.deferred?
+        dequeue_all
+        components.update
+        delay
+      end
+    end
+
+    def dequeue_all
+      stdout_queue.length.times {
+        line.print_over(stdout_queue.pop(non_block = true))
+      }
+    rescue ThreadError # where we pop an empty queue with non_block = true
+    end
+
+    def delay
+      sleep(sleep_time)
+    end
+
+    private
+    attr_reader :line, :stdout_queue, :winch
+  end
+
+  class Components
+    attr_reader :members
+    def initialize(line)
+      @line = line
+      @members = []
+    end
+
+    def add(style: {}, pad: {left: 0, right: 0}, justify: :left, &callback)
+      members << Component.new(line, callback, style, pad, justify)
+      line.reset
+    end
+
+    def update
+      members.each {|x| x.update}
+    end
+
     private
     attr_reader :line
+
+    class Component < Array
+      attr_accessor :style, :pad, :justify
+      DEFAULT_PAD = {left: 0, right: 0}
+
+      def initialize(line, callback, style, pad, justify)
+        super()
+        @line = line
+        @style = style
+        @pad = DEFAULT_PAD.merge(pad)
+        @justify = justify
+        @callback = callback
+        update
+      end
+
+      def update_style(style)
+        self.map{|x| x.update_style(style)}
+      end
+
+      def update
+        hard = !(self.length > 0)
+        #byebug
+
+        callback.call
+          .to_s
+          .chars
+          .unshift(*Array.new(pad[:left]) {' '})
+          .push(*Array.new(pad[:right]) {' '})
+          .each_with_index do |char, i|
+
+          if self[i].nil?
+            self[i] = Character.new(content: char, style: style)
+          else
+            self[i].content = char if (self[i].is_bg || self[i].content != char)
+          end
+        end
+
+        hard ? line.reset : line.refresh(self)
+      end
+
+      private
+      attr_reader :line, :callback
+    end # Component
+  end # Components
+
+  class Winch
+    attr_reader :deferred, :last
+    def initialize(&callback)
+      @deferred = false
+      @last = now
+      @callback = callback
+      Signal.trap('SIGWINCH', self.method(:handle))
+    end
+
+    def deferred?
+      if deferred && last < now - 2
+        handle
+      end
+    end
+
+    def handle(*args)
+      unless suppress_burst
+        @deferred = false
+        @last = now
+        callback.call
+      end
+    end
+
+    def suppress_burst
+      @deferred = last >= now - 2
+    end
+
+    private
+    attr_reader :callback
+
+    def now
+      Time.now.to_i
+    end
   end
 
   class Line < Array
-    def initialize(common: nil)
+    attr_accessor :components
+
+    def initialize
       super()
       @cursor = Cursor.new(self)
-      @components = {fills: [], fixed: []}
+      @components = []
       @offsets = {}
       @refresh_counter = 0
-      rewiden #TODO trap sigwinch and call this
+      rewiden
+    end
+
+    def print_over(*args)
+      clear_line
+      cursor.locate
+      puts "\n" + args.join(' ')
+      reset
     end
 
     def refresh(component)
-      if @refresh_counter > 64
-        @refresh_counter = 0
-        reset
-      else
-        @refresh_counter += 1
-        cursor.locate
-        cursor.reflow(from: offsets[component], to: offsets[component] + component.length)
-      end
+      to = offsets[component].nil? ? nil : offsets[component] + component.length
+      @refresh_counter > 64 ? reset : cursor.reflow(from: offsets[component], to: to)
+      @refresh_counter += 1
     end
 
-    def reset # TODO refactor bc this is ugly af
-      # populate the line:
-      # 1. clear the line
-      # 2. left and right pinned justifieds are placed in the line
-      # 3. all fills get an equal slice of the remaining space on the line
-      #   # when resizes happen fills extend or retract
+    def clear_line
+      self.length > 0 && self[0, self.length] = Array.new(self.length) {Character.new(is_bg: true)} # set all to background
+    end
 
-      if self.length > 0
-        self[0, self.length] = Array.new(self.length) {Character.new(is_bg: true)} # set all to background
-      end
+    def reset
+      @refresh_counter = 0
+      clear_line
+      cursor.locate
 
-      # Fixed width setting
-      components[:fixed].select {|a| a.justify == :left}.each do |fixed|
-        offset = first_free
-        offsets[fixed] = offset
-        self[offset, fixed.length] = fixed
-      end
-      components[:fixed].select {|a| a.justify == :right}.each do |fixed|
-        #byebug
-        offset = first_free(from: :right) - fixed.length + 1
-        offsets[fixed] = offset
-        self[offset, fixed.length] = fixed
+      components.each do |c|
+        offset = c.justify == :left ? first_free : first_free(from: :right) - c.length + 1
+        offsets[c] = offset
+        self[offset, c.length] = c
       end
 
-      # Variable width setting (aka fills)
-      if components[:fills].length > 0
-        #byebug
-        fill_space_per = ((first_free(from: :right) - first_free) / components[:fills].length).floor
-      end
-      components[:fills].select {|a| a.justify == :left}.each do |fill|
-        offset = first_free
-        offsets[fill] = offset
-        self[offset, fill_space_per] = fill
-      end
-      components[:fills].select {|a| a.justify == :right}.each do |fill|
-        offset = first_free(from: :right) - fill_space_per + 1
-        offsets[fill] = offset
-        self[offset - fill_space_per, fill_space_per] = fill
-      end
       cursor.reflow
     end
 
-    def add_component(content:, style: {}, fill: false, left_pad: 0, right_pad: 0, justify: :left)
-      args = {content: content, style: style, fill: fill, left_pad: left_pad, right_pad: right_pad, justify: justify}
-      new_component = Component.new(line: self, **args)
-      new_component.fill ? components[:fills].push(new_component) : components[:fixed].push(new_component)
-      reset
-      new_component
-    end
-
-    def del_component(component)
-      # TODO
+    def rewiden(*args)
+      delta = terminal_width - self.length
+      delta.negative? ? shorten(delta.abs) : lengthen(delta)
     end
 
     private
-    attr_accessor :cursor, :background, :components, :offsets
+    attr_accessor :cursor, :background, :offsets
     def first_free(from: :left)
       idx = nil
       from == :left && idx = self.index {|x| x.is_bg}
@@ -126,14 +214,8 @@ module VP
       idx
     end
 
-    def rewiden
-      delta = terminal_width - self.length
-      delta.negative? ? shorten(delta.abs) : lengthen(delta)
-    end
-
     def lengthen(delta)
       self.push(*Array.new(delta) {Character.new(is_bg: true)})
-      # ^ we do it this janky way because you can't += on self (no self reassign)
       reset
     end
 
@@ -147,49 +229,6 @@ module VP
     end
   end
 
-  class Component < Array
-    attr_accessor :style, :left_pad, :right_pad, :justify
-    attr_reader :fill
-
-    def initialize(line:, content:, style: {}, fill: false, left_pad: 0, right_pad: 0, justify: :left)
-      super()
-      @line = line
-      @style = style
-      @left_pad = left_pad
-      @right_pad = right_pad
-      @fill = fill
-      @justify = justify
-      update(content)
-    end
-
-    def update_style(style)
-      self.map{|x| x.update_style(style)}
-    end
-
-    def update(str)
-      hard = false
-      if self.length == 0
-        hard = true
-      end
-      str
-        .to_s
-        .chars
-        .unshift(*Array.new(left_pad) {' '})
-        .push(*Array.new(right_pad) {' '})
-        .each_with_index do |char, i|
-
-        if self[i].nil?
-          self[i] = Character.new(content: char, style: style)
-        else
-          self[i].content = char if (self[i].is_bg || self[i].content != char)
-        end
-      end
-      hard ? line.reset : line.refresh(self)
-    end
-    private
-    attr_reader :line
-  end
-
   class Cursor
     attr_reader :position
     def initialize(line)
@@ -201,12 +240,12 @@ module VP
     end
 
     def locate
-      (line.length * 2).times {left}
+      1024.times {down; left}
     end
 
-    def reflow(from: 0, to: nil)
+    def reflow(from: nil, to: nil)
       to ||= upper_bound
-      line[from, to].nil? && byebug
+      from ||= 0
       line[from, to].each {|c| c.drawn = false}
       [to, from]
         .sort {|a,b| ((position - a).abs < (position - b).abs) ? -1 : 1}
@@ -239,6 +278,14 @@ module VP
           @position = position >= upper_bound ? upper_bound : position + 1
         end
       }
+    end
+
+    def down(qty = 1)
+      print("\e[#{qty}B")
+    end
+
+    def up(qty = 1)
+      print("\e[#{qty}A")
     end
 
     def draw!
